@@ -1,44 +1,47 @@
-﻿# ClickUp Dashboard (Local)
+# ClickUp Dashboard
 
-Dashboard operacional em React + Node para monitorar fluxo de tarefas no ClickUp.
+Dashboard legado separado usado pelo gerenciador e tambem acessivel diretamente.
 
-## O que entrega
+## Portas
 
-- Saude do fluxo: WIP, backlog, concluidas hoje/semana, atrasadas.
-- Gargalos: aging por status, lead time, cycle time, top 10 tasks paradas.
-- Capacidade: carga por responsavel, fila por prioridade.
-- Qualidade/SLA: SLA cumprido vs estourado, categorias, primeira resposta (quando houver campo).
+- Backend: `3001`
+- Frontend: `5173`
 
-## Backend
+## Setup
 
-```bash
+### Backend
+
+```powershell
 cd backend
-npm install
-cp .env.example .env
+Copy-Item .env.example .env
 # preencha CLICKUP_API_KEY
+npm install
 npm run start
 ```
 
-Backend padrao: `http://localhost:3001`
+### Frontend
 
-## Frontend
-
-```bash
+```powershell
 cd frontend
+Copy-Item .env.example .env
 npm install
-cp .env.example .env
-# opcional: ajuste VITE_API_BASE_URL para seu backend
-npm run dev
+npm run preview -- --host 0.0.0.0 --port 5173
 ```
 
-Frontend padrao: `http://localhost:5173`
+## Integracao com o gerenciador
 
-## Atualizacao
+Quando o repositorio `dashboard_manager` estiver ao lado deste repositorio, os scripts dele conseguem subir esta stack inteira automaticamente.
 
-- O frontend permite polling de `1s`, `2s` ou `3s`.
-- O backend usa cache em memoria (`CACHE_TTL_MS`) para reduzir chamadas ao ClickUp.
+Estrutura esperada:
+
+```text
+workspace/
+  dashboard_manager/
+  clickup_dashboard/
+```
 
 ## Observacoes
 
-- O KPI de retrabalho e um proxy quando nao ha historico detalhado de transicoes.
-- Aging usa `date_status_changed`/`date_updated`/`date_created` conforme disponibilidade.
+- O backend cria automaticamente a pasta/arquivo de historico em `backend/data/dashboard_history.json` quando necessario.
+- Esse arquivo e dado de runtime local e nao faz parte do codigo versionado.
+- O frontend aceita `VITE_API_BASE_URL` vazio para usar o host atual automaticamente.
