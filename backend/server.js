@@ -3,6 +3,9 @@ const express = require("express");
 const cors = require("cors");
 const axios = require("axios");
 const compression = require("compression");
+const fs = require("fs");
+const path = require("path");
+const crypto = require("crypto");
 
 const app = express();
 app.use(compression());
@@ -19,6 +22,22 @@ const DEFAULT_TABLE_PAGE_SIZE = Math.max(10, Number(process.env.DEFAULT_TABLE_PA
 const MAX_TABLE_PAGE_SIZE = Math.max(
   DEFAULT_TABLE_PAGE_SIZE,
   Number(process.env.MAX_TABLE_PAGE_SIZE || 200)
+);
+const TIMESERIES_DEFAULT_PERIOD_DAYS = Math.max(
+  1,
+  Number(process.env.TIMESERIES_DEFAULT_PERIOD_DAYS || 7)
+);
+const TIMESERIES_MAX_PERIOD_DAYS = Math.max(
+  TIMESERIES_DEFAULT_PERIOD_DAYS,
+  Number(process.env.TIMESERIES_MAX_PERIOD_DAYS || 90)
+);
+const SNAPSHOT_STORE_FILE = path.resolve(
+  process.env.SNAPSHOT_STORE_FILE || path.join(__dirname, "data", "dashboard_history.json")
+);
+const SNAPSHOT_RETENTION_DAYS = Math.max(7, Number(process.env.SNAPSHOT_RETENTION_DAYS || 400));
+const SNAPSHOT_FLUSH_DEBOUNCE_MS = Math.max(
+  250,
+  Number(process.env.SNAPSHOT_FLUSH_DEBOUNCE_MS || 1500)
 );
 
 const CLICKUP_API_KEY = process.env.CLICKUP_API_KEY;
@@ -64,6 +83,200 @@ const teamsCache = new Map();
 const inflightTeams = new Map();
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+const HOUR_MS = 60 * 60 * 1000;
+const SNAPSHOT_PRIMARY_BUCKET = "hour";
+const snapshotHistory = new Map();
+let snapshotHistoryLoaded = false;
+let snapshotHistoryFlushTimer = null;
+
+const safeNumber = (value, fallback = 0) => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+};
+
+const hashTokenFingerprint = (rawToken) => {
+  const token = normalizeToken(rawToken);
+  if (!token) return "default";
+  return crypto.createHash("sha256").update(token).digest("hex").slice(0, 24);
+};
+
+const getBucketStartMs = (valueMs, bucket = SNAPSHOT_PRIMARY_BUCKET) => {
+  const resolvedMs = safeNumber(valueMs, Date.now());
+  const date = new Date(resolvedMs);
+  if (bucket === "day") {
+    date.setUTCHours(0, 0, 0, 0);
+    return date.getTime();
+  }
+  date.setUTCMinutes(0, 0, 0);
+  return date.getTime();
+};
+
+const buildSnapshotFilterKey = (filters = {}) => {
+  const periodDays = Math.max(1, Math.floor(safeNumber(filters.periodDays, DEFAULT_PERIOD_DAYS)));
+  const status = normalizeText(filters.status || "") || "all";
+  const category = normalizeText(filters.category || "") || "all";
+  const assignee = normalizeText(filters.assignee || "") || "all";
+  const priority = normalizeText(filters.priority || "") || "all";
+  return [
+    `period:${periodDays}`,
+    `status:${status}`,
+    `category:${category}`,
+    `assignee:${assignee}`,
+    `priority:${priority}`,
+  ].join("|");
+};
+
+const buildSnapshotCompositeKey = (entry) =>
+  [
+    entry.tokenFingerprint,
+    entry.teamId,
+    entry.scopeType,
+    entry.scopeId || "all",
+    entry.filterKey,
+    String(entry.bucketStartMs),
+  ].join("::");
+
+const readSnapshotStoreFromDisk = () => {
+  if (snapshotHistoryLoaded) return;
+  snapshotHistoryLoaded = true;
+
+  try {
+    if (!fs.existsSync(SNAPSHOT_STORE_FILE)) return;
+    const raw = fs.readFileSync(SNAPSHOT_STORE_FILE, "utf8");
+    if (!raw.trim()) return;
+    const parsed = JSON.parse(raw);
+    const entries = Array.isArray(parsed?.entries) ? parsed.entries : [];
+    entries.forEach((entry) => {
+      if (!entry || !entry.teamId || !entry.scopeType || !entry.filterKey) return;
+      const normalized = {
+        tokenFingerprint: String(entry.tokenFingerprint || "default"),
+        teamId: String(entry.teamId),
+        scopeType: String(entry.scopeType),
+        scopeId: entry.scopeId ? String(entry.scopeId) : null,
+        filterKey: String(entry.filterKey),
+        bucketStartMs: safeNumber(entry.bucketStartMs, 0),
+        recordedAtMs: safeNumber(entry.recordedAtMs, 0),
+        metrics: entry.metrics && typeof entry.metrics === "object" ? entry.metrics : {},
+      };
+      if (!normalized.bucketStartMs) return;
+      snapshotHistory.set(buildSnapshotCompositeKey(normalized), normalized);
+    });
+  } catch (error) {
+    console.error("[History] Failed to load snapshot store:", error.message);
+  }
+};
+
+const cleanupExpiredSnapshots = (nowMs = Date.now()) => {
+  const cutoffMs = nowMs - SNAPSHOT_RETENTION_DAYS * DAY_MS;
+  for (const [key, entry] of snapshotHistory.entries()) {
+    if (!entry || safeNumber(entry.bucketStartMs, 0) < cutoffMs) {
+      snapshotHistory.delete(key);
+    }
+  }
+};
+
+const flushSnapshotStoreToDisk = () => {
+  readSnapshotStoreFromDisk();
+  cleanupExpiredSnapshots(Date.now());
+
+  try {
+    fs.mkdirSync(path.dirname(SNAPSHOT_STORE_FILE), { recursive: true });
+    const entries = Array.from(snapshotHistory.values()).sort(
+      (left, right) => left.bucketStartMs - right.bucketStartMs
+    );
+    const payload = {
+      version: 1,
+      generatedAt: new Date().toISOString(),
+      entries,
+    };
+    const tempFile = `${SNAPSHOT_STORE_FILE}.tmp`;
+    fs.writeFileSync(tempFile, JSON.stringify(payload, null, 2), "utf8");
+    fs.renameSync(tempFile, SNAPSHOT_STORE_FILE);
+  } catch (error) {
+    console.error("[History] Failed to persist snapshot store:", error.message);
+  }
+};
+
+const scheduleSnapshotStoreFlush = () => {
+  if (snapshotHistoryFlushTimer) return;
+  snapshotHistoryFlushTimer = setTimeout(() => {
+    snapshotHistoryFlushTimer = null;
+    flushSnapshotStoreToDisk();
+  }, SNAPSHOT_FLUSH_DEBOUNCE_MS);
+};
+
+const buildDashboardSnapshotMetrics = (payload) => {
+  const counters = payload?.counters || {};
+  const slaMet = safeNumber(counters.slaMet, 0);
+  const slaBreached = safeNumber(counters.slaBreached, 0);
+  const slaBase = slaMet + slaBreached;
+  const slaCompliancePct = slaBase > 0 ? Number(((slaMet / slaBase) * 100).toFixed(2)) : 0;
+
+  return {
+    wipTotal: safeNumber(counters.wipTotal, 0),
+    backlog: safeNumber(counters.backlog, 0),
+    inProgress: safeNumber(counters.inProgress, 0),
+    waiting: safeNumber(counters.waiting, 0),
+    overdueTotal: safeNumber(counters.overdueTotal, 0),
+    doneToday: safeNumber(counters.doneToday, 0),
+    doneWeek: safeNumber(counters.doneWeek, 0),
+    reworkRatePercent: safeNumber(counters.reworkRatePercent, 0),
+    slaCompliancePct,
+  };
+};
+
+const upsertDashboardSnapshot = ({ token, team, scope, filters, payload, nowMs = Date.now() }) => {
+  if (!team || !scope || !payload) return;
+  readSnapshotStoreFromDisk();
+
+  const entry = {
+    tokenFingerprint: hashTokenFingerprint(token),
+    teamId: String(team.id),
+    scopeType: String(scope.type || "team"),
+    scopeId: scope.id ? String(scope.id) : null,
+    filterKey: buildSnapshotFilterKey(filters || {}),
+    bucketStartMs: getBucketStartMs(nowMs, SNAPSHOT_PRIMARY_BUCKET),
+    recordedAtMs: nowMs,
+    metrics: buildDashboardSnapshotMetrics(payload),
+  };
+
+  snapshotHistory.set(buildSnapshotCompositeKey(entry), entry);
+  cleanupExpiredSnapshots(nowMs);
+  scheduleSnapshotStoreFlush();
+};
+
+const findMatchingSnapshots = ({
+  token,
+  teamId,
+  scope,
+  filters,
+  minBucketStartMs,
+  maxBucketStartMs,
+}) => {
+  readSnapshotStoreFromDisk();
+
+  const tokenFingerprint = hashTokenFingerprint(token);
+  const filterKey = buildSnapshotFilterKey(filters || {});
+  const scopeType = String(scope?.type || "team");
+  const scopeId = scope?.id ? String(scope.id) : null;
+  const safeTeamId = String(teamId || "");
+  const minMs = safeNumber(minBucketStartMs, 0);
+  const maxMs = safeNumber(maxBucketStartMs, Date.now());
+  const result = [];
+
+  for (const entry of snapshotHistory.values()) {
+    if (!entry || entry.tokenFingerprint !== tokenFingerprint) continue;
+    if (entry.teamId !== safeTeamId) continue;
+    if (entry.scopeType !== scopeType) continue;
+    if (String(entry.scopeId || "") !== String(scopeId || "")) continue;
+    if (entry.filterKey !== filterKey) continue;
+    if (entry.bucketStartMs < minMs || entry.bucketStartMs > maxMs) continue;
+    result.push(entry);
+  }
+
+  result.sort((left, right) => left.bucketStartMs - right.bucketStartMs);
+  return result;
+};
 
 const toMs = (value) => {
   if (value === null || value === undefined || value === "") return null;
@@ -81,6 +294,249 @@ const normalizeText = (value = "") =>
 
 const formatPercent = (value, decimals = 1) =>
   Number.isFinite(value) ? Number(value.toFixed(decimals)) : 0;
+
+const SNAPSHOT_METRIC_CATALOG = {
+  wipTotal: { id: "wipTotal", label: "WIP Aberto", unit: "tasks" },
+  backlog: { id: "backlog", label: "Backlog", unit: "tasks" },
+  inProgress: { id: "inProgress", label: "Em Andamento", unit: "tasks" },
+  waiting: { id: "waiting", label: "Aguardando", unit: "tasks" },
+  overdueTotal: { id: "overdueTotal", label: "Atrasadas", unit: "tasks" },
+  doneToday: { id: "doneToday", label: "Concluidas Hoje", unit: "tasks" },
+  doneWeek: { id: "doneWeek", label: "Concluidas na Semana", unit: "tasks" },
+  slaCompliancePct: { id: "slaCompliancePct", label: "SLA Compliance", unit: "%" },
+  reworkRatePercent: { id: "reworkRatePercent", label: "Retrabalho", unit: "%" },
+};
+
+const normalizeTimeseriesMetric = (rawMetric) => {
+  const metric = String(rawMetric || "wipTotal").trim();
+  return SNAPSHOT_METRIC_CATALOG[metric] ? metric : "wipTotal";
+};
+
+const normalizeTimeseriesBucket = (rawBucket) => {
+  const value = normalizeText(rawBucket || "hour");
+  return value === "day" ? "day" : "hour";
+};
+
+const normalizeTimeseriesCompare = (rawCompare) => {
+  const value = normalizeText(rawCompare || "yesterday");
+  if (value === "none") return "none";
+  if (value === "previous_period") return "previous_period";
+  return "yesterday";
+};
+
+const buildTimeseriesLabel = (bucketStartMs, bucket) => {
+  const value = new Date(bucketStartMs);
+  if (bucket === "day") {
+    return value.toLocaleDateString("pt-BR", { day: "2-digit", month: "2-digit" });
+  }
+  return value.toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" });
+};
+
+const extractSnapshotMetricValue = (entry, metric) => {
+  if (!entry || !entry.metrics || typeof entry.metrics !== "object") return null;
+  const value = Number(entry.metrics[metric]);
+  return Number.isFinite(value) ? value : null;
+};
+
+const computeSeriesTrend = (points) => {
+  const samples = points
+    .map((point, index) => ({ index, value: point?.value }))
+    .filter((sample) => Number.isFinite(sample.value));
+  if (samples.length < 2) {
+    return {
+      direction: "no_data",
+      slope: null,
+    };
+  }
+
+  const n = samples.length;
+  const sumX = samples.reduce((sum, item) => sum + item.index, 0);
+  const sumY = samples.reduce((sum, item) => sum + item.value, 0);
+  const sumXY = samples.reduce((sum, item) => sum + item.index * item.value, 0);
+  const sumXX = samples.reduce((sum, item) => sum + item.index * item.index, 0);
+  const denominator = n * sumXX - sumX * sumX;
+  if (!denominator) {
+    return {
+      direction: "stable",
+      slope: 0,
+    };
+  }
+
+  const slope = (n * sumXY - sumX * sumY) / denominator;
+  const roundedSlope = Number(slope.toFixed(4));
+  if (Math.abs(roundedSlope) < 0.01) {
+    return {
+      direction: "stable",
+      slope: roundedSlope,
+    };
+  }
+
+  return {
+    direction: roundedSlope > 0 ? "up" : "down",
+    slope: roundedSlope,
+  };
+};
+
+const buildTimeseriesPayloadFromSnapshots = ({
+  entries,
+  metricId,
+  metricSpec,
+  team,
+  scope,
+  filters,
+  bucket,
+  compare,
+  periodDays,
+  nowMs,
+}) => {
+  const bucketSizeMs = bucket === "day" ? DAY_MS : HOUR_MS;
+  const totalPoints = bucket === "day" ? periodDays : periodDays * 24;
+  const safePointCount = Math.max(1, totalPoints);
+  const endBucketStartMs = getBucketStartMs(nowMs, bucket);
+  const startBucketStartMs = endBucketStartMs - (safePointCount - 1) * bucketSizeMs;
+  const compareShiftMs =
+    compare === "yesterday"
+      ? DAY_MS
+      : compare === "previous_period"
+        ? safePointCount * bucketSizeMs
+        : 0;
+
+  const byBucketStart = new Map();
+  (entries || []).forEach((entry) => {
+    const aggregateBucketStart = getBucketStartMs(entry.bucketStartMs, bucket);
+    const candidate = {
+      bucketStartMs: aggregateBucketStart,
+      value: extractSnapshotMetricValue(entry, metricId),
+      recordedAtMs: safeNumber(entry.recordedAtMs, 0),
+    };
+    const current = byBucketStart.get(aggregateBucketStart);
+    if (!current || candidate.recordedAtMs >= current.recordedAtMs) {
+      byBucketStart.set(aggregateBucketStart, candidate);
+    }
+  });
+
+  const rawPoints = [];
+  for (let index = 0; index < safePointCount; index += 1) {
+    const bucketStartMs = startBucketStartMs + index * bucketSizeMs;
+    const currentEntry = byBucketStart.get(bucketStartMs);
+    const value = currentEntry ? currentEntry.value : null;
+    const compareEntry = compareShiftMs ? byBucketStart.get(bucketStartMs - compareShiftMs) : null;
+    const baselineValue = compareEntry ? compareEntry.value : null;
+    const delta =
+      Number.isFinite(value) && Number.isFinite(baselineValue)
+        ? Number((value - baselineValue).toFixed(2))
+        : null;
+    const deltaPercent =
+      Number.isFinite(value) && Number.isFinite(baselineValue) && baselineValue !== 0
+        ? Number((((value - baselineValue) / baselineValue) * 100).toFixed(2))
+        : null;
+
+    rawPoints.push({
+      time: new Date(bucketStartMs).toISOString(),
+      label: buildTimeseriesLabel(bucketStartMs, bucket),
+      value: Number.isFinite(value) ? value : null,
+      baselineValue: Number.isFinite(baselineValue) ? baselineValue : null,
+      delta,
+      deltaPercent,
+      hasData: Number.isFinite(value),
+      baselineHasData: Number.isFinite(baselineValue),
+    });
+  }
+
+  const firstKnownValuePoint = rawPoints.find((point) => Number.isFinite(point.value));
+  const firstKnownBaselinePoint = rawPoints.find((point) => Number.isFinite(point.baselineValue));
+  const firstKnownValue = firstKnownValuePoint ? firstKnownValuePoint.value : null;
+  const firstKnownBaseline = firstKnownBaselinePoint ? firstKnownBaselinePoint.baselineValue : null;
+
+  let carryValue = firstKnownValue;
+  let carryBaseline = firstKnownBaseline;
+  const points = rawPoints.map((point) => {
+    let value = Number.isFinite(point.value) ? point.value : null;
+    let baselineValue = Number.isFinite(point.baselineValue) ? point.baselineValue : null;
+
+    if (!Number.isFinite(value) && Number.isFinite(carryValue)) {
+      value = carryValue;
+    }
+    if (!Number.isFinite(baselineValue) && Number.isFinite(carryBaseline)) {
+      baselineValue = carryBaseline;
+    }
+
+    if (Number.isFinite(value)) carryValue = value;
+    if (Number.isFinite(baselineValue)) carryBaseline = baselineValue;
+
+    const delta =
+      Number.isFinite(value) && Number.isFinite(baselineValue)
+        ? Number((value - baselineValue).toFixed(2))
+        : null;
+    const deltaPercent =
+      Number.isFinite(value) && Number.isFinite(baselineValue) && baselineValue !== 0
+        ? Number((((value - baselineValue) / baselineValue) * 100).toFixed(2))
+        : null;
+
+    return {
+      ...point,
+      value: Number.isFinite(value) ? value : null,
+      baselineValue: Number.isFinite(baselineValue) ? baselineValue : null,
+      delta,
+      deltaPercent,
+      hasData: Number.isFinite(value),
+      baselineHasData: Number.isFinite(baselineValue),
+    };
+  });
+
+  const validValues = points.filter((point) => Number.isFinite(point.value));
+  const latestPoint = [...points].reverse().find((point) => Number.isFinite(point.value)) || null;
+  const previousPoint =
+    latestPoint &&
+    [...points]
+      .filter((point) => Number.isFinite(point.value) && point.time !== latestPoint.time)
+      .reverse()[0];
+  const peakPoint =
+    validValues.length > 0
+      ? validValues.reduce((best, current) => (current.value > best.value ? current : best))
+      : null;
+  const trend = computeSeriesTrend(points);
+
+  return {
+    generatedAt: new Date(nowMs).toISOString(),
+    team: {
+      id: String(team.id),
+      name: team.name,
+      color: team.color || null,
+    },
+    scope: {
+      type: scope.type,
+      id: scope.id,
+      label: buildScopeLabel(scope),
+    },
+    metric: metricSpec,
+    bucket,
+    compare,
+    periodDays,
+    filters: {
+      applied: {
+        periodDays: Math.max(1, Math.floor(safeNumber(filters.periodDays, DEFAULT_PERIOD_DAYS))),
+        status: String(filters.status || "").trim() || null,
+        category: String(filters.category || "").trim() || null,
+        assignee: String(filters.assignee || "").trim() || null,
+        priority: String(filters.priority || "").trim() || null,
+      },
+    },
+    points,
+    summary: {
+      latestValue: latestPoint ? latestPoint.value : null,
+      previousValue: previousPoint ? previousPoint.value : null,
+      baselineValue: latestPoint ? latestPoint.baselineValue : null,
+      delta: latestPoint ? latestPoint.delta : null,
+      deltaPercent: latestPoint ? latestPoint.deltaPercent : null,
+      trendDirection: trend.direction,
+      trendSlope: trend.slope,
+      peakValue: peakPoint ? peakPoint.value : null,
+      peakAt: peakPoint ? peakPoint.time : null,
+      pointsWithData: validValues.length,
+    },
+  };
+};
 
 const getStatusLabel = (task) => task?.status?.status || "Sem status";
 
@@ -1638,6 +2094,111 @@ app.get("/api/navigation", async (req, res) => {
   }
 });
 
+app.get("/api/dashboard/timeseries", async (req, res) => {
+  try {
+    const requestedTeamId = req.query.teamId ? String(req.query.teamId) : null;
+    const token = resolveRequestToken(req);
+    const scope = resolveScope(req.query.scopeType, req.query.scopeId);
+    const dashboardFilters = resolveDashboardFilters(req.query || {});
+    const metricId = normalizeTimeseriesMetric(req.query.metric);
+    const metricSpec = SNAPSHOT_METRIC_CATALOG[metricId];
+    const bucket = normalizeTimeseriesBucket(req.query.bucket);
+    const compare = normalizeTimeseriesCompare(req.query.compare);
+    const historyDays = Math.min(
+      TIMESERIES_MAX_PERIOD_DAYS,
+      Math.max(1, Math.floor(safeNumber(req.query.historyDays, TIMESERIES_DEFAULT_PERIOD_DAYS)))
+    );
+    const forceRefresh =
+      String(req.query.force || "").toLowerCase() === "true" ||
+      String(req.query.force || "") === "1";
+
+    const client = getClickUpClient(token);
+    const team = await getTeamByIdOrDefault(requestedTeamId, token, client, forceRefresh);
+
+    const nowMs = Date.now();
+    const bucketSizeMs = bucket === "day" ? DAY_MS : HOUR_MS;
+    const pointCount = bucket === "day" ? historyDays : historyDays * 24;
+    const compareShiftMs =
+      compare === "yesterday"
+        ? DAY_MS
+        : compare === "previous_period"
+          ? pointCount * bucketSizeMs
+          : 0;
+
+    const endBucketStartMs = getBucketStartMs(nowMs, bucket);
+    const startBucketStartMs = endBucketStartMs - (pointCount - 1) * bucketSizeMs;
+    const minBucketStartMs = Math.max(0, startBucketStartMs - compareShiftMs);
+    const maxBucketStartMs = getBucketStartMs(nowMs, SNAPSHOT_PRIMARY_BUCKET);
+
+    let entries = findMatchingSnapshots({
+      token: token || CLICKUP_API_KEY,
+      teamId: team.id,
+      scope,
+      filters: dashboardFilters,
+      minBucketStartMs,
+      maxBucketStartMs,
+    });
+
+    if (!entries.length) {
+      const allTeamTasks = await getTeamTasksCached({
+        token,
+        teamId: team.id,
+        client,
+        forceRefresh: false,
+      });
+      const scopedTasks = filterTasksByScope(allTeamTasks, scope);
+      const filteredTasks = filterTasksByDashboardFilters(scopedTasks, dashboardFilters, nowMs);
+      const payload = buildDashboard({
+        team,
+        tasks: filteredTasks,
+        scopedTaskCount: scopedTasks.length,
+        dimensionBaseTasks: scopedTasks,
+        filters: dashboardFilters,
+        sourceTaskCount: allTeamTasks.length,
+        scope,
+        nowMs,
+      });
+      upsertDashboardSnapshot({
+        token: token || CLICKUP_API_KEY,
+        team,
+        scope,
+        filters: dashboardFilters,
+        payload,
+        nowMs,
+      });
+
+      entries = findMatchingSnapshots({
+        token: token || CLICKUP_API_KEY,
+        teamId: team.id,
+        scope,
+        filters: dashboardFilters,
+        minBucketStartMs,
+        maxBucketStartMs,
+      });
+    }
+
+    const payload = buildTimeseriesPayloadFromSnapshots({
+      entries,
+      metricId,
+      metricSpec,
+      team,
+      scope,
+      filters: dashboardFilters,
+      bucket,
+      compare,
+      periodDays: historyDays,
+      nowMs,
+    });
+
+    return res.json(payload);
+  } catch (error) {
+    console.error("Failed to build dashboard timeseries:", error.response?.data || error.message);
+    return res.status(error.statusCode || error.response?.status || 500).json({
+      error: "Failed to build dashboard timeseries",
+    });
+  }
+});
+
 app.get("/api/dashboard", async (req, res) => {
   try {
     const requestedTeamId = req.query.teamId ? String(req.query.teamId) : null;
@@ -1669,6 +2230,14 @@ app.get("/api/dashboard", async (req, res) => {
             const scopedTasks = filterTasksByScope(allTeamTasks, scope);
             const filteredTasks = filterTasksByDashboardFilters(scopedTasks, dashboardFilters, Date.now());
             const payload = buildDashboard({ team, tasks: filteredTasks, scopedTaskCount: scopedTasks.length, dimensionBaseTasks: scopedTasks, filters: dashboardFilters, sourceTaskCount: allTeamTasks.length, scope, nowMs: Date.now() });
+            upsertDashboardSnapshot({
+              token: token || CLICKUP_API_KEY,
+              team,
+              scope,
+              filters: dashboardFilters,
+              payload,
+              nowMs: Date.now(),
+            });
             dashboardCache.set(cacheKey, { cachedAtMs: Date.now(), payload });
             return payload;
           } catch (e) {
@@ -1707,6 +2276,14 @@ app.get("/api/dashboard", async (req, res) => {
         filters: dashboardFilters,
         sourceTaskCount: allTeamTasks.length,
         scope,
+        nowMs: Date.now(),
+      });
+      upsertDashboardSnapshot({
+        token: token || CLICKUP_API_KEY,
+        team,
+        scope,
+        filters: dashboardFilters,
+        payload,
         nowMs: Date.now(),
       });
 
